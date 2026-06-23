@@ -61,6 +61,9 @@ function t() {
             "clean_ok") echo "Система очищена" ;;
             "deps") echo "Установка зависимостей (WireGuard, iptables)..." ;;
             "deps_ok") echo "Зависимости установлены" ;;
+            "deps_err") echo "Ошибка установки зависимостей" ;;
+            "no_pm") echo "Не найден поддерживаемый пакетный менеджер (apt/dnf/yum/zypper/pacman/apk/emerge)" ;;
+            "no_systemd") echo "systemd не обнаружен — автозапуск туннеля и watchdog работать не будут (нужен ручной запуск/другой init)" ;;
             "wgcf") echo "Загрузка ядра wgcf..." ;;
             "wgcf_ok") echo "Ядро установлено" ;;
             "reg") echo "Регистрация в сети Cloudflare..." ;;
@@ -88,6 +91,9 @@ function t() {
             "clean_ok") echo "System cleaned" ;;
             "deps") echo "Installing dependencies (WireGuard, iptables)..." ;;
             "deps_ok") echo "Dependencies installed" ;;
+            "deps_err") echo "Dependency installation failed" ;;
+            "no_pm") echo "No supported package manager found (apt/dnf/yum/zypper/pacman/apk/emerge)" ;;
+            "no_systemd") echo "systemd not detected — tunnel autostart and watchdog will not work (manual start / other init needed)" ;;
             "wgcf") echo "Downloading wgcf core..." ;;
             "wgcf_ok") echo "Core installed" ;;
             "reg") echo "Registering Cloudflare account..." ;;
@@ -111,12 +117,110 @@ function t() {
     fi
 }
 
+# --- Dependencies (distro-agnostic) ---
+# Presence is verified with `command -v` (works on any distro), so only the
+# commands that are actually missing get installed — through whichever package
+# manager the system ships with (apt / dnf / yum / zypper / pacman / apk / emerge).
+
+# Echo the first supported package manager found, or return 1 if none.
+function detect_pm() {
+    local pm
+    for pm in apt-get dnf yum zypper pacman apk emerge; do
+        command -v "$pm" &>/dev/null && { echo "$pm"; return 0; }
+    done
+    return 1
+}
+
+# Translate a required command into the package that provides it for $pm.
+function pkg_name() {
+    local cmd="$1" pm="$2"
+    case "$pm" in
+        emerge)  # Gentoo (Portage atoms)
+            case "$cmd" in
+                wg-quick) echo "net-vpn/wireguard-tools" ;;
+                iptables) echo "net-firewall/iptables" ;;
+                ip)       echo "sys-apps/iproute2" ;;
+                curl)     echo "net-misc/curl" ;;
+                wget)     echo "net-misc/wget" ;;
+            esac ;;
+        dnf|yum) # Fedora / RHEL family
+            case "$cmd" in
+                wg-quick) echo "wireguard-tools" ;;
+                iptables) echo "iptables" ;;
+                ip)       echo "iproute" ;;
+                curl)     echo "curl" ;;
+                wget)     echo "wget" ;;
+            esac ;;
+        pacman|zypper|apk) # Arch/Manjaro, openSUSE, Alpine (identical names)
+            case "$cmd" in
+                wg-quick) echo "wireguard-tools" ;;
+                iptables) echo "iptables" ;;
+                ip)       echo "iproute2" ;;
+                curl)     echo "curl" ;;
+                wget)     echo "wget" ;;
+            esac ;;
+        *)       # apt-get (Debian / Ubuntu) — wireguard metapackage keeps the
+                 # kernel-module fallback for older kernels, as the original did.
+            case "$cmd" in
+                wg-quick) echo "wireguard" ;;
+                iptables) echo "iptables" ;;
+                ip)       echo "iproute2" ;;
+                curl)     echo "curl" ;;
+                wget)     echo "wget" ;;
+            esac ;;
+    esac
+}
+
+# Install the given packages quietly with the detected package manager.
+function pm_install() {
+    local pm="$1"; shift
+    case "$pm" in
+        apt-get) apt-get update -qq &>/dev/null
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" &>/dev/null ;;
+        dnf)     dnf install -y "$@" &>/dev/null ;;
+        yum)     yum install -y "$@" &>/dev/null ;;
+        # --needed skips already-present packages; these are leaf deps, so the
+        # -Sy partial-upgrade caveat is low risk here.
+        pacman)  pacman -Sy --needed --noconfirm "$@" &>/dev/null ;;
+        zypper)  zypper --non-interactive --quiet install "$@" &>/dev/null ;;
+        apk)     apk add --no-cache "$@" &>/dev/null ;;
+        emerge)  emerge --quiet --noreplace "$@" &>/dev/null ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Verify required commands and install only what is missing.
+function install_deps() {
+    local required=(wg-quick ip iptables curl wget)
+    local cmd pm pkg
+    local missing_cmds=() missing_pkgs=()
+
+    for cmd in "${required[@]}"; do
+        command -v "$cmd" &>/dev/null || missing_cmds+=("$cmd")
+    done
+    [[ ${#missing_cmds[@]} -eq 0 ]] && return 0   # already satisfied
+
+    pm=$(detect_pm) || fail "$(t "no_pm")"
+
+    for cmd in "${missing_cmds[@]}"; do
+        pkg=$(pkg_name "$cmd" "$pm")
+        [[ -n "$pkg" ]] && missing_pkgs+=("$pkg")
+    done
+
+    pm_install "$pm" "${missing_pkgs[@]}" || fail "$(t "deps_err") ($pm)"
+}
+
 # --- Pre-flight Checks ---
 [[ $EUID -ne 0 ]] && fail "$(t "root_req")"
 
 # --- Start ---
 select_language
 print_logo
+
+# Steps 7–9 (start/watchdog) rely on systemctl — warn upfront on non-systemd
+# inits (Alpine, OpenRC Gentoo, …). `/run/systemd/system` exists only when
+# systemd is the running init, so this catches more than `command -v systemctl`.
+[[ -d /run/systemd/system ]] || warn "$(t "no_systemd")"
 
 # 1. Cleanup
 step "🗑️  $(t "clean")"
@@ -126,10 +230,9 @@ rm -rf /opt/warp-native /opt/vps-warp /etc/cron.d/warp-native /usr/local/bin/war
 systemctl daemon-reload
 done_ "$(t "clean_ok")"
 
-# 2. Dependencies
+# 2. Dependencies (distro-agnostic — see install_deps)
 step "📦 $(t "deps")"
-apt-get update -qq &>/dev/null
-apt-get install -y wireguard iptables iproute2 curl wget &>/dev/null || fail "APT Error"
+install_deps
 done_ "$(t "deps_ok")"
 
 # 3. WGCF Download
