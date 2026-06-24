@@ -81,7 +81,8 @@ function select_language {
     echo -e "     ${C_CYN}[2]${C_RST} Русский\n"
     
     while true; do
-        read -p "  > " choice
+        # Read from the terminal, not stdin: lets `curl ... | bash` still prompt.
+        if [[ -e /dev/tty ]]; then read -p "  > " choice </dev/tty; else read -p "  > " choice; fi
         case $choice in
             1) SCRIPT_LANG="en"; break ;;
             2) SCRIPT_LANG="ru"; break ;;
@@ -220,7 +221,7 @@ SAVED_LICENSE=""
 echo ""
 echo -e "  $(t "plus_ask")"
 [[ -n "$SAVED_LICENSE" ]] && echo -e "  ${C_GRY}$(t "plus_keep_hint")${C_RST}"
-read -p "  > " WARP_LICENSE
+if [[ -e /dev/tty ]]; then read -p "  > " WARP_LICENSE </dev/tty; else read -p "  > " WARP_LICENSE; fi
 # Empty input + a saved key => keep the existing WARP+ license.
 [[ -z "$WARP_LICENSE" && -n "$SAVED_LICENSE" ]] && WARP_LICENSE="$SAVED_LICENSE"
 if [[ -n "$WARP_LICENSE" ]]; then
