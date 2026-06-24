@@ -1,11 +1,21 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.1)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.2)
 # ==============================================================================
 
 APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
+
+# Bump on every release. Used by `vps-warp update` for version comparison.
+SCRIPT_VERSION="3.2"
+# Persistent state dir — NOT wiped by the cleanup step. Holds installed
+# version and the saved WARP+ license so updates don't lose them.
+STATE_DIR="/etc/vps-warp"
+LICENSE_FILE="${STATE_DIR}/license"
+VERSION_FILE="${STATE_DIR}/version"
+# Source of truth for self-update.
+RAW_URL="https://raw.githubusercontent.com/Dristal-Kakals/vps-warp/main/warp_install.sh"
 
 # --- Colors & Styling ---
 C_RST="\e[0m"
@@ -97,6 +107,7 @@ function t() {
             "scan_ok") echo "Лучший эндпоинт выбран:" ;;
             "scan_fail") echo "Эндпоинты не ответили на ping, берём случайный." ;;
             "plus_ask") echo "🔑 Введите ключ WARP+ (или нажмите Enter для бесплатной версии):" ;;
+            "plus_keep_hint") echo "(Enter — оставить сохранённый ключ)" ;;
             "plus_apply") echo "Активация WARP+..." ;;
             "plus_ok") echo "Лицензия активирована!" ;;
             "plus_err") echo "Ошибка ключа, используем базовый тариф." ;;
@@ -127,6 +138,7 @@ function t() {
             "scan_ok") echo "Best endpoint selected:" ;;
             "scan_fail") echo "No endpoints answered ping, falling back to random." ;;
             "plus_ask") echo "🔑 Enter WARP+ key (or press Enter for free tier):" ;;
+            "plus_keep_hint") echo "(Enter — keep the saved key)" ;;
             "plus_apply") echo "Activating WARP+..." ;;
             "plus_ok") echo "License activated!" ;;
             "plus_err") echo "Key error, using free tier." ;;
@@ -202,15 +214,25 @@ wgcf generate &>/dev/null || fail "Config generation failed. Cloudflare might be
 done_ "$(t "reg_ok")"
 
 # 5. WARP+
+# Reuse a previously saved license on update so WARP+ survives a re-run.
+SAVED_LICENSE=""
+[[ -f "$LICENSE_FILE" ]] && SAVED_LICENSE=$(tr -cd 'a-zA-Z0-9-' < "$LICENSE_FILE")
 echo ""
 echo -e "  $(t "plus_ask")"
+[[ -n "$SAVED_LICENSE" ]] && echo -e "  ${C_GRY}$(t "plus_keep_hint")${C_RST}"
 read -p "  > " WARP_LICENSE
+# Empty input + a saved key => keep the existing WARP+ license.
+[[ -z "$WARP_LICENSE" && -n "$SAVED_LICENSE" ]] && WARP_LICENSE="$SAVED_LICENSE"
 if [[ -n "$WARP_LICENSE" ]]; then
     # Security: Санитизация ввода (оставляем только буквы, цифры и дефисы)
     WARP_LICENSE=$(echo "$WARP_LICENSE" | tr -cd 'a-zA-Z0-9-')
     step "💎 $(t "plus_apply")"
     if wgcf update --license-key "$WARP_LICENSE" &>/dev/null; then
         wgcf generate &>/dev/null
+        # Persist for future updates (root-only readable).
+        mkdir -p "$STATE_DIR"
+        printf '%s\n' "$WARP_LICENSE" > "$LICENSE_FILE"
+        chmod 600 "$LICENSE_FILE"
         done_ "$(t "plus_ok")"
     else
         warn "$(t "plus_err")"
@@ -423,7 +445,43 @@ function show_status {
     echo -e "   ${C_GRY}Traffic:${C_RST}      ${C_YLW}↓ ${rx_fmt}${C_RST}  ${C_GRY}|${C_RST}  ${C_YLW}↑ ${tx_fmt}${C_RST}"
     
     echo -e "\n  ${C_GRY}───────────────────────────────────${C_RST}"
-    echo -e "   ${C_GRY}Commands:${C_RST} vps-warp ${C_BLD}start${C_RST} | ${C_BLD}stop${C_RST} | ${C_BLD}log${C_RST}\n"
+    echo -e "   ${C_GRY}Commands:${C_RST} vps-warp ${C_BLD}start${C_RST} | ${C_BLD}stop${C_RST} | ${C_BLD}restart${C_RST} | ${C_BLD}log${C_RST} | ${C_BLD}update${C_RST}\n"
+}
+
+# Self-update: fetch the latest installer, compare versions, reinstall if newer.
+# `vps-warp update --force` reinstalls even when versions match.
+RAW_URL="https://raw.githubusercontent.com/Dristal-Kakals/vps-warp/main/warp_install.sh"
+VERSION_FILE="/etc/vps-warp/version"
+
+function update_self {
+    local force="$1" tmp remote local_v newest
+    echo -e "\n  ${C_CYN}▶${C_RST} ${C_BLD}Checking for updates...${C_RST}"
+    tmp=$(mktemp) || { echo -e "  ${C_RED}✖ Error:${C_RST} mktemp failed"; exit 1; }
+    # -f: fail on HTTP errors so we never run an error page as a script.
+    curl -fsSL "$RAW_URL" -o "$tmp" || { rm -f "$tmp"; echo -e "  ${C_RED}✖ Error:${C_RST} download failed"; exit 1; }
+
+    remote=$(grep -m1 -oP '^SCRIPT_VERSION="\K[^"]+' "$tmp")
+    [[ -z "$remote" ]] && { rm -f "$tmp"; echo -e "  ${C_RED}✖ Error:${C_RST} cannot read remote version"; exit 1; }
+    local_v=$(cat "$VERSION_FILE" 2>/dev/null || echo "0")
+
+    newest=$(printf '%s\n%s\n' "$local_v" "$remote" | sort -V | tail -1)
+    if [[ "$force" != "--force" && "$remote" == "$local_v" ]]; then
+        rm -f "$tmp"
+        echo -e "  ${C_GRN}✔${C_RST} Already up to date (v${local_v})"
+        exit 0
+    fi
+    if [[ "$force" != "--force" && "$newest" == "$local_v" ]]; then
+        rm -f "$tmp"
+        echo -e "  ${C_YLW}⚠${C_RST} Installed v${local_v} is newer than remote v${remote}; use --force to reinstall"
+        exit 0
+    fi
+
+    echo -e "  ${C_GRN}✔${C_RST} Updating v${local_v} → v${remote}"
+    chmod +x "$tmp"
+    bash "$tmp"
+    local rc=$?
+    rm -f "$tmp"
+    exit $rc
 }
 
 case "$1" in
@@ -431,10 +489,15 @@ case "$1" in
     stop)    systemctl stop wg-quick@warp; show_status ;;
     restart) systemctl restart wg-quick@warp; show_status ;;
     log)     journalctl -u warp-watchdog.service -f ;;
+    update)  update_self "$2" ;;
     *)       show_status ;;
 esac
 EOF
 chmod +x /usr/local/bin/vps-warp
+
+# Record installed version so `vps-warp update` can compare against the remote.
+mkdir -p "$STATE_DIR"
+printf '%s\n' "$SCRIPT_VERSION" > "$VERSION_FILE"
 
 # Finish
 echo -e "\n  🎉 ${C_GRN}${C_BLD}$(t "finish")${C_RST}"
